@@ -15,6 +15,7 @@
   label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
   input[type=text], textarea { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--text); font:inherit; }
   textarea { min-height:140px; resize:vertical; }
+  #ids { min-height:90px; }
   .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; } @media (max-width:640px){ .grid{grid-template-columns:1fr;} }
   .drop { border:2px dashed var(--line); border-radius:10px; padding:16px; text-align:center; cursor:pointer; color:var(--muted); min-height:120px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:8px; }
   .drop.over { border-color:var(--brand); }
@@ -23,7 +24,7 @@
   button.ghost { background:transparent; color:var(--text); border:1px solid var(--line); }
   button:disabled { opacity:.5; cursor:default; }
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  .msg { margin-top:10px; font-size:13px; } .msg.ok{color:var(--ok);} .msg.err{color:var(--err);}
+  .msg { margin-top:10px; font-size:13px; } .msg.ok{color:var(--ok);} .msg.err{color:var(--err);} .msg.warn{color:var(--warn);}
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:middle; }
   td img { width:36px; height:36px; object-fit:cover; border-radius:6px; }
@@ -40,13 +41,38 @@
 <main>
   <div>
     <h1>Logo Automation Dashboard</h1>
-    <div class="muted">Add a logo + prompts here. The extension picks them up automatically and runs them.</div>
+    <div class="muted">Add customer IDs (auto-import) or a logo + prompts manually. The extension picks them up automatically.</div>
   </div>
 
   <section class="card">
-    <h2>New job</h2>
-    <label>License key (must match the key activated in the extension)</label>
+    <label style="margin-top:0">License key (must match the key activated in the extension)</label>
     <input id="license" type="text" placeholder="Your license key" autocomplete="off" />
+  </section>
+
+  <!-- NEW: import from customer database -->
+  <section class="card">
+    <h2>Import from customer database</h2>
+    <div class="muted">Enter customer IDs (comma, space or one per line). Only these IDs are read from <code>sulekha_records</code> — logo, business name and copied line are filled in automatically.</div>
+    <label>Customer IDs</label>
+    <textarea id="ids" placeholder="12345&#10;12346&#10;12347"></textarea>
+    <label style="display:flex;gap:8px;align-items:center;margin-top:12px;color:var(--text);font-size:13px;">
+      <input id="syncImp" type="checkbox" checked /> Sync generated images to cloud
+    </label>
+    <div class="row" style="margin-top:14px;">
+      <button id="fetchIds">Fetch data</button>
+      <button id="queueIds" class="ghost" disabled>Send to extension</button>
+      <span id="impMsg" class="msg"></span>
+    </div>
+    <div style="overflow-x:auto;margin-top:12px;">
+      <table>
+        <thead><tr><th></th><th>Customer ID</th><th>Business</th><th>Prompts (copied line)</th><th>Status</th></tr></thead>
+        <tbody id="impRows"><tr><td colspan="5" class="muted">Nothing fetched yet.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>New job (manual)</h2>
     <div class="grid">
       <div>
         <label>Business label</label>
@@ -94,21 +120,87 @@
 </main>
 
 <script>
-// Same project as the extension's cloud.js
+// Job queue project (same as the extension's cloud.js)
 const SUPABASE_URL = "https://qnttlpvskhbdxplxhkea.supabase.co";
 const SUPABASE_KEY = "sb_publishable_FazEEXKHh0XW6Eik-F6zVw_rZJv4nvP";
 const UPLOAD_BUCKET = "dashboard-uploads";
+// Customer database project (sulekha_records)
+const DB2_URL = "https://tsjkkicdaflxzdncupno.supabase.co";
+const DB2_KEY = "sb_publishable_R-wQAOCiOYaHt6syxcvTLg_keHCBYcz";
 
 const $ = (id) => document.getElementById(id);
 const H = (extra = {}) => ({ apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY, ...extra });
+const H2 = () => ({ apikey: DB2_KEY, Authorization: "Bearer " + DB2_KEY });
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 const slug = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "item";
 let file = null;
+let imported = []; // ready-to-queue rows from the customer database
 
 try { $("license").value = localStorage.getItem("dash_license") || ""; } catch {}
 $("license").addEventListener("input", () => { try { localStorage.setItem("dash_license", $("license").value.trim()); } catch {} });
 
 function setMsg(text, cls) { const m = $("msg"); m.textContent = text; m.className = "msg " + (cls || ""); }
+function setImpMsg(text, cls) { const m = $("impMsg"); m.textContent = text; m.className = "msg " + (cls || ""); }
+
+// --- NEW: import by customer IDs ---
+$("fetchIds").addEventListener("click", async () => {
+  const ids = [...new Set($("ids").value.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean))];
+  imported = []; $("queueIds").disabled = true;
+  if (!ids.length) return setImpMsg("Enter at least one customer ID", "err");
+  $("fetchIds").disabled = true; setImpMsg("Fetching…");
+  try {
+    const list = ids.map((i) => '"' + i.replace(/"/g, "") + '"').join(",");
+    const q = new URLSearchParams({
+      customer_id: `in.(${list})`,
+      select: "customer_id,business_name,copied_line,logo_url,logo_source_url",
+    });
+    const r = await fetch(`${DB2_URL}/rest/v1/sulekha_records?${q}`, { headers: H2(), cache: "no-store" });
+    if (!r.ok) throw new Error(r.status + " " + await r.text());
+    const rows = await r.json();
+    const byId = new Map(rows.map((x) => [String(x.customer_id), x]));
+    const html = [];
+    let ready = 0;
+    for (const id of ids) {
+      const x = byId.get(id);
+      if (!x) { html.push(`<tr><td></td><td>${esc(id)}</td><td colspan="2" class="muted">Not found in database</td><td><span class="pill failed">missing</span></td></tr>`); continue; }
+      const logo = x.logo_url || x.logo_source_url || "";
+      const prompts = String(x.copied_line || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+      const problem = !logo ? "no logo" : !prompts.length ? "no copied line" : "";
+      if (!problem) {
+        ready++;
+        const name = x.business_name || id;
+        imported.push({ business_label: name, save_folder: slug(id + "-" + name), logo_url: logo, logo_name: id, prompts });
+      }
+      html.push(`<tr>
+        <td>${logo ? `<img src="${esc(logo)}" alt="">` : ""}</td>
+        <td>${esc(id)}</td><td>${esc(x.business_name || "")}</td>
+        <td>${prompts.length ? esc(prompts[0].slice(0, 80)) + (prompts.length > 1 ? ` <span class="muted">(+${prompts.length - 1} more)</span>` : "") : '<span class="muted">—</span>'}</td>
+        <td><span class="pill ${problem ? "failed" : "done"}">${problem || "ready"}</span></td></tr>`);
+    }
+    $("impRows").innerHTML = html.join("");
+    $("queueIds").disabled = !ready;
+    setImpMsg(`${ready} of ${ids.length} ready to send.`, ready === ids.length ? "ok" : "warn");
+  } catch (e) { setImpMsg(e.message, "err"); }
+  finally { $("fetchIds").disabled = false; }
+});
+
+$("queueIds").addEventListener("click", async () => {
+  const license = $("license").value.trim();
+  if (!license) return setImpMsg("License key is required", "err");
+  if (!imported.length) return;
+  $("queueIds").disabled = true; setImpMsg("Creating jobs…");
+  try {
+    const rows = imported.map((j) => ({ ...j, license_key: license, sync_to_cloud: $("syncImp").checked, status: "pending" }));
+    const ins = await fetch(`${SUPABASE_URL}/rest/v1/queue_jobs`, {
+      method: "POST", headers: H({ "Content-Type": "application/json", Prefer: "return=minimal" }), body: JSON.stringify(rows),
+    });
+    if (!ins.ok) throw new Error("Job insert failed: " + ins.status + " " + await ins.text());
+    setImpMsg(`Sent ${rows.length} job(s). The extension will pick them up shortly.`, "ok");
+    imported = []; $("ids").value = "";
+    $("impRows").innerHTML = `<tr><td colspan="5" class="muted">Nothing fetched yet.</td></tr>`;
+    loadJobs();
+  } catch (e) { setImpMsg(e.message, "err"); $("queueIds").disabled = false; }
+});
 
 // --- image picker ---
 function setFile(f) {
@@ -124,7 +216,7 @@ $("drop").addEventListener("drop", (e) => setFile(e.dataTransfer.files[0]));
 $("label").addEventListener("input", () => { if (!$("folder").dataset.touched) $("folder").value = slug($("label").value); });
 $("folder").addEventListener("input", () => { $("folder").dataset.touched = "1"; });
 
-// --- submit ---
+// --- manual submit ---
 $("submit").addEventListener("click", async () => {
   const license = $("license").value.trim();
   const label = $("label").value.trim();
@@ -185,7 +277,7 @@ async function loadJobs() {
   } catch (e) { $("jobs").innerHTML = `<tr><td colspan="5" class="msg err">Could not load jobs: ${esc(e.message)}</td></tr>`; }
 }
 
-// --- results gallery (reads rows the extension writes to generated_posts) ---
+// --- results gallery ---
 async function loadResults() {
   try {
     const q = new URLSearchParams({ status: "eq.success", order: "created_at.desc", limit: "24", select: "business_label,prompt,public_url" });
